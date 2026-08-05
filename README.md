@@ -1,68 +1,71 @@
 # MinIO Replication Only
 
-This repository contains a single replication-focused solution:
+Đây là một giải pháp chỉ tập trung vào replication:
 
 MinIO1 -> Python replicator -> MinIO2
 
-The stack does not use Kafka or Flink anymore. MinIO1 emits webhook notifications to a Python service, the service optionally scans the existing bucket on startup, deduplicates work with SQLite, and streams objects from MinIO1 to MinIO2.
+Stack này không còn dùng Kafka hay Flink. MinIO1 gửi webhook đến một service Python, service có thể quét bucket hiện có khi khởi động, dedup công việc bằng SQLite, rồi stream object từ MinIO1 sang MinIO2.
 
-## Architecture
+## Kiến trúc
 
-The runtime is split into three independently started containers:
+Runtime được tách thành 3 container chạy độc lập:
 
-- MinIO1, exposed on `http://localhost:9000` and `http://localhost:9001`
-- MinIO2, exposed on `http://localhost:9002` and `http://localhost:9003`
-- Replicator, exposed on `http://localhost:8080`
+- MinIO1, truy cập tại `http://localhost:9000` và `http://localhost:9001`
+- MinIO2, truy cập tại `http://localhost:9002` và `http://localhost:9003`
+- Replicator, truy cập tại `http://localhost:8080`
 
-Each container joins the same external Docker network: `stream-s3-replication`.
+Mỗi container cùng join vào một Docker network external: `stream-s3-replication`.
 
-## Project Layout
+## Cấu Trúc Dự Án
 
-Top-level files:
+Các file ở mức gốc:
 
-- `docker-compose.minio1.yml`: standalone MinIO1 stack
-- `docker-compose.minio2.yml`: standalone MinIO2 stack
-- `docker-compose.replicator.yml`: replicator and bootstrap stack
-- `start.sh`: one-command startup for Linux/macOS shells
-- `start.ps1`: one-command startup for PowerShell on Windows
-- `.env.example`: environment variables used by the replicator and bootstrap script
+- `docker-compose.minio1.yml`: stack riêng cho MinIO1
+- `docker-compose.minio2.yml`: stack riêng cho MinIO2
+- `docker-compose.replicator.yml`: stack cho replicator và bootstrap
+- `start.sh`: lệnh khởi động một phát cho Linux/macOS shell
+- `start.ps1`: lệnh khởi động một phát cho PowerShell trên Windows
+- `.env.example`: các biến môi trường dùng cho replicator và bootstrap script
 
-Docker assets:
+Tài nguyên Docker:
 
-- `docker/Dockerfile.replication`: image for the Python replicator
-- `docker/bootstrap-replication.sh`: bootstrap script that creates buckets, registers webhook notifications, and creates a UI user
+- `docker/Dockerfile.replication`: image cho Python replicator
+- `docker/bootstrap-replication.sh`: script bootstrap tạo bucket, đăng ký webhook và tạo user UI
 
-Source code:
+Mã nguồn:
 
-- `src/common`: shared helper code
-	- `events.py`: event model and JSON parsing
-	- `minio_io.py`: MinIO client helpers
-	- `config.py`: shared config helper module kept in the repo
-- `src/replication`: the active runtime
-	- `app.py`: webhook server, queue, worker loop, initial sync, copy flow
-	- `config.py`: replication settings loaded from environment variables
-	- `dedup.py`: SQLite-backed dedup/state store
+- `src/common`: code helper dùng chung
 
-## How to Run
+  - `events.py`: model event và parse JSON
+  - `minio_io.py`: helper làm việc với MinIO client
+  - `config.py`: module config dùng chung còn giữ lại trong repo
 
-Recommended startup:
+- `src/replication`: runtime đang được dùng
+
+  - `app.py`: webhook server, queue, worker loop, initial sync, copy flow
+  - `config.py`: settings của replicator đọc từ biến môi trường
+  - `dedup.py`: nơi lưu dedup/state bằng SQLite
+
+## Cách Chạy
+
+Khuyến nghị:
 
 ```bash
 ./start.sh
 ```
 
-On Windows PowerShell:
+Trên Windows PowerShell:
 
 ```powershell
 .\start.ps1
 ```
 
-The startup scripts do two things:
+Hai script khởi động này làm 2 việc:
 
-1. Create the external network `stream-s3-replication` if it does not already exist.
-2. Start the three compose files in order: MinIO1, MinIO2, then the replicator stack.
+1. Tạo network external `stream-s3-replication` nếu chưa tồn tại.
+2. Chạy 3 compose file theo thứ tự: MinIO1, MinIO2, rồi stack replicator.
 
-If you prefer manual startup, use these commands instead:
+Nếu muốn chạy thủ công, dùng các lệnh sau:
 
 ```bash
 docker network create stream-s3-replication
@@ -71,133 +74,133 @@ docker compose -f docker-compose.minio2.yml up -d
 docker compose -f docker-compose.replicator.yml up --build -d
 ```
 
-## What the Bootstrap Script Does
+## Bootstrap Script Làm Gì
 
-When `docker-compose.replicator.yml` starts, it launches a `minio/mc` container that runs `docker/bootstrap-replication.sh`.
+Khi `docker-compose.replicator.yml` chạy, nó sẽ khởi động một container `minio/mc` để thực thi `docker/bootstrap-replication.sh`.
 
-That script:
+Script này sẽ:
 
-- waits until MinIO1 and MinIO2 are reachable
-- creates the `images` bucket on both MinIO instances if needed
-- registers a MinIO webhook notification on MinIO1
-- creates a UI user for object uploads
-- attaches the `readwrite` policy to that user on both MinIO instances
+- đợi đến khi MinIO1 và MinIO2 sẵn sàng
+- tạo bucket `images` trên cả hai MinIO nếu chưa có
+- đăng ký webhook notification trên MinIO1
+- tạo một user UI để upload object
+- gắn policy `readwrite` cho user đó trên cả hai MinIO
 
-## Runtime Flow
+## Luồng Hoạt Động
 
-The code path is centered in [src/replication/app.py](src/replication/app.py).
+Luồng code chính nằm ở [src/replication/app.py](src/replication/app.py).
 
-### 1. Service startup
+### 1. Khởi động service
 
-`main()` reads settings from the environment, creates the shared queue, starts worker threads, and optionally launches the initial sync thread.
+`main()` đọc settings từ environment, tạo queue dùng chung, khởi động worker threads, và nếu cần thì chạy initial sync thread.
 
 ### 2. Initial sync
 
-If `INITIAL_SYNC=true`, `_initial_sync()` lists objects in the source bucket and pushes synthetic events into the same queue used by webhook events.
+Nếu `INITIAL_SYNC=true`, `_initial_sync()` sẽ list object trong bucket nguồn và đẩy các event giả vào cùng queue dùng cho webhook.
 
-That means initial data and realtime data follow the same downstream path.
+Nghĩa là dữ liệu cũ và dữ liệu realtime đi chung một downstream path.
 
-### 3. Webhook intake
+### 3. Nhận webhook
 
-MinIO1 sends an HTTP `POST` request to `/minio-webhook` whenever an object is created.
+MinIO1 gửi HTTP `POST` tới `/minio-webhook` mỗi khi có object được tạo.
 
-`WebhookHandler.do_POST()` reads the body, validates the path, and enqueues the payload.
+`WebhookHandler.do_POST()` đọc body request, kiểm tra đúng path, rồi đẩy payload vào queue.
 
-### 4. Worker execution
+### 4. Worker xử lý
 
-`_worker_loop()` continuously consumes events from the queue and calls `_replicate_event()`.
+`_worker_loop()` liên tục lấy event từ queue và gọi `_replicate_event()`.
 
-The queue is bounded, so if the service is overloaded, requests can be back-pressured instead of unboundedly consuming memory.
+Queue có giới hạn độ lớn, nên nếu service bị quá tải thì request sẽ bị back-pressure thay vì phình bộ nhớ vô hạn.
 
-### 5. Copy decision
+### 5. Quyết định copy
 
-`_replicate_event()` parses the payload into a `StreamEvent` and then applies these checks:
+`_replicate_event()` parse payload thành một `StreamEvent`, rồi thực hiện các bước sau:
 
-- ignore non-copyable event types
-- ignore events from buckets other than the configured source bucket
-- compute a dedup key
-- claim the dedup key in SQLite
-- check whether the destination already has the same object
+- bỏ qua event không thể copy
+- bỏ qua event không thuộc bucket nguồn đã cấu hình
+- tạo dedup key
+- claim dedup key trong SQLite
+- kiểm tra xem MinIO2 đã có cùng object chưa
 
-### 6. Data transfer
+### 6. Truyền dữ liệu
 
-If the object must be copied, the replicator:
+Nếu object cần được copy, replicator sẽ:
 
-- reads metadata from MinIO1 with `stat_object`
-- downloads the object body from MinIO1 with `get_object`
-- uploads the object to MinIO2 with `put_object`
+- đọc metadata từ MinIO1 bằng `stat_object`
+- tải body object từ MinIO1 bằng `get_object`
+- upload object sang MinIO2 bằng `put_object`
 
-This is a streamed transfer. The full object is not loaded into memory at once.
+Đây là kiểu stream transfer. Toàn bộ object không bị nạp một lần vào bộ nhớ.
 
-### 7. Completion
+### 7. Hoàn tất
 
-After a successful transfer, the record is marked `done` in SQLite.
+Sau khi truyền thành công, record sẽ được đánh dấu `done` trong SQLite.
 
-If any exception occurs, the record is released so a later retry can attempt the copy again.
+Nếu có exception, record sẽ được release để lần retry sau có thể thử lại.
 
-## Dedup Strategy
+## Chiến Lược Dedup
 
-Dedup is implemented in [src/replication/dedup.py](src/replication/dedup.py).
+Dedup được implement trong [src/replication/dedup.py](src/replication/dedup.py).
 
-The dedup key is built from:
+Dedup key được tạo từ:
 
 - bucket
 - object key
 - etag
 
-That means:
+Điều này có nghĩa là:
 
-- the same object version is processed once
-- webhook duplicates are ignored
-- an initial sync event and a realtime webhook event for the same object version collapse into one copy
-- a restart does not reprocess already completed objects
+- cùng một version của object chỉ xử lý một lần
+- webhook duplicate sẽ bị bỏ qua
+- event initial sync và event realtime của cùng một object version sẽ hợp nhất thành một lần copy
+- restart service sẽ không xử lý lại object đã hoàn thành
 
-### Dedup State Machine
+### Máy Trạng Thái Dedup
 
-The SQLite table stores one row per object version.
+Bảng SQLite lưu một dòng cho mỗi object version.
 
-Status values:
+Các trạng thái:
 
-- `processing`: the record has been claimed, but copy is not finished yet
-- `done`: the object has been successfully replicated or was already up to date in MinIO2
+- `processing`: record đã được claim nhưng copy chưa xong
+- `done`: object đã replicate thành công hoặc đã up-to-date ở MinIO2
 
-Processing TTL:
+TTL xử lý:
 
-- `DEDUP_PROCESSING_TTL_SECONDS` defaults to `600`
-- if a record stays in `processing` too long, it becomes eligible again
-- this protects against worker crashes or abrupt container restarts
+- `DEDUP_PROCESSING_TTL_SECONDS` mặc định là `600`
+- nếu record nằm ở `processing` quá lâu thì nó sẽ được phép xử lý lại
+- điều này bảo vệ khi worker crash hoặc container dừng đột ngột
 
 ### Claim / Complete / Release
 
-- `claim()` inserts the dedup key with `processing`
-- if the key already exists, the event is treated as duplicate and skipped
-- `complete()` marks the row as `done`
-- `release()` removes the row when an error happens before completion
+- `claim()` chèn dedup key với trạng thái `processing`
+- nếu key đã tồn tại, event sẽ được coi là duplicate và bỏ qua
+- `complete()` đổi trạng thái thành `done`
+- `release()` xóa row nếu có lỗi trước khi hoàn tất
 
-## State Storage
+## Lưu State Ở Đâu
 
-Persistent state is stored in SQLite.
+State bền vững được lưu trong SQLite.
 
-Default path:
+Đường dẫn mặc định:
 
 - `DEDUP_DB_PATH=/data/dedup.sqlite3`
 
-That path is mounted to the `replication-data` Docker volume in `docker-compose.replicator.yml`, so the dedup state survives restarts.
+Path này được mount vào Docker volume `replication-data` trong `docker-compose.replicator.yml`, nên dedup state vẫn còn sau khi restart.
 
-The database stores:
+Cơ sở dữ liệu lưu các trường sau:
 
 - dedup key
-- source bucket and key
+- source bucket và object key
 - etag
-- file size
+- dung lượng file
 - event type
 - status
-- claim timestamp
-- completion timestamp
+- thời điểm claim
+- thời điểm complete
 
-## Environment Variables
+## Biến Môi Trường
 
-Important variables in `.env.example`:
+Các biến quan trọng trong `.env.example`:
 
 - `SOURCE_MINIO_ENDPOINT`
 - `SOURCE_MINIO_ACCESS_KEY`
@@ -220,27 +223,27 @@ Important variables in `.env.example`:
 - `MINIO_UI_USER`
 - `MINIO_UI_PASSWORD`
 
-## Useful Endpoints
+## Endpoint Hữu Ích
 
 - MinIO1 console: `http://localhost:9001`
 - MinIO2 console: `http://localhost:9003`
 - Replicator webhook: `http://localhost:8080/minio-webhook`
 
-## Design Notes
+## Ghi Chú Thiết Kế
 
-This implementation is intentionally small and practical.
+Implementation này cố ý giữ nhỏ và thực dụng.
 
-Good fit:
+Phù hợp với:
 
-- simple MinIO-to-MinIO sync
-- moderate write load
-- straightforward debug and deployment
+- đồng bộ MinIO-to-MinIO đơn giản
+- write load mức vừa
+- cần debug và triển khai nhanh
 
-Tradeoffs:
+Tradeoff:
 
-- single process replicator
-- SQLite is local to the container volume
-- no distributed queue
-- no horizontal coordination across multiple replicator replicas
+- replicator chạy đơn process
+- SQLite nằm local trong volume của container
+- không có distributed queue
+- không có coordination ngang hàng giữa nhiều replicator replica
 
-If you need multi-node replication workers or stronger delivery guarantees, move dedup/state to an external store such as Redis or Postgres.
+Nếu bạn cần worker replication đa node hoặc delivery guarantee mạnh hơn, hãy đưa dedup/state sang một external store như Redis hoặc Postgres.
