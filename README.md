@@ -1,468 +1,246 @@
-# Tài liệu logic source code ApiIntegrationIngestor
+# MinIO Replication Only
 
-## 1. Mục đích hệ thống
+This repository contains a single replication-focused solution:
 
-`ApiIntegrationIngestor` là service FastAPI dùng để tiếp nhận dữ liệu XML từ hệ thống bên ngoài, kiểm tra dữ liệu theo schema cấu hình động trong MongoDB, ghi dữ liệu hợp lệ vào MongoDB, ghi lịch sử đồng bộ, thống kê kết quả xử lý và phát sự kiện Kafka nếu cấu hình cho phép.
+MinIO1 -> Python replicator -> MinIO2
 
-Service hỗ trợ hai chế độ tiếp nhận:
+The stack does not use Kafka or Flink anymore. MinIO1 emits webhook notifications to a Python service, the service optionally scans the existing bucket on startup, deduplicates work with SQLite, and streams objects from MinIO1 to MinIO2.
 
-- `POST /api/v1/integration/ingest/batch`: nhận một XML chứa nhiều bản ghi `<Root>` trong `<DanhSach>`.
-- `POST /api/v1/integration/ingest/stream`: nhận một XML chứa một bản ghi.
+## Architecture
 
-Ngoài ra service có endpoint:
+The runtime is split into three independently started containers:
 
-- `GET /api/v1/health`: kiểm tra trạng thái MongoDB và Kafka.
+- MinIO1, exposed on `http://localhost:9000` and `http://localhost:9001`
+- MinIO2, exposed on `http://localhost:9002` and `http://localhost:9003`
+- Replicator, exposed on `http://localhost:8080`
 
-## 2. Thành phần chính
+Each container joins the same external Docker network: `stream-s3-replication`.
 
-| Thành phần | File | Vai trò |
-| --- | --- | --- |
-| FastAPI app/lifespan | `src/main.py` | Khởi tạo app, thread pool, MongoDB, Kafka, schema cache, statistic service và health loop |
-| Integration route | `src/routes/integration.py` | Nhận request, kiểm tra header/content-type/body, gọi validate, ghi DB, produce Kafka, trả response |
-| ValidateSchemaService | `src/services/validate_schema_service.py` | Parse XML, lấy schema đã compile, validate bằng Pydantic model động, lưu lỗi validate |
-| SchemaConfig | `src/utils/schema_config.py` | Poll `JobConfig` và `SchemaDefinition` từ MongoDB, compile schema thành Pydantic model và cache |
-| ProcessDataService | `src/services/process_data_service.py` | Build MongoDB upsert operation, ghi dữ liệu chính và lịch sử trong transaction |
-| KafkaService | `src/services/kafka_service.py` | Quản lý Kafka producer, transform record và gửi message |
-| StatisticService | `src/services/statistic_service.py` | Gom thống kê trong memory buffer và định kỳ flush sang MongoDB |
-| DatabaseManager | `src/core/configs/database_config.py` | Quản lý MongoDB clients cho data DB, job DB và analytics DB |
-| Exception handlers | `src/core/handlers/*` | Chuẩn hóa response lỗi XML |
-| Custom log middleware | `src/core/middlewares/custom_log.py` | Tạo `request_id`, đo thời gian xử lý và log request |
+## Project Layout
 
-## 3. Luồng khởi động ứng dụng
+Top-level files:
 
-Khi FastAPI chạy, `lifespan` trong `src/main.py` thực hiện các bước:
+- `docker-compose.minio1.yml`: standalone MinIO1 stack
+- `docker-compose.minio2.yml`: standalone MinIO2 stack
+- `docker-compose.replicator.yml`: replicator and bootstrap stack
+- `start.sh`: one-command startup for Linux/macOS shells
+- `start.ps1`: one-command startup for PowerShell on Windows
+- `.env.example`: environment variables used by the replicator and bootstrap script
 
-1. Tạo `ThreadPoolExecutor` với số worker lấy từ `INGEST_WORKERS`.
-2. Kết nối các MongoDB client thông qua `DatabaseManager.connect_all()`.
-3. Khởi tạo Kafka producer bằng `kafkaService.ensure_producer()`.
-4. Khởi động `SchemaConfig` để load schema lần đầu từ MongoDB:
-   - Đọc collection `JobConfigCDDHs`.
-   - Lấy schema hiện hành từ `SchemaDefinitionCDDHs`.
-   - Compile schema JSON thành Pydantic model.
-   - Cache schema theo `datatype_name` và `topic_name`.
-5. Khởi động `StatisticService` để flush thống kê định kỳ.
-6. Tạo background task `_health_check_loop()` để kiểm tra MongoDB/Kafka định kỳ.
+Docker assets:
 
-Khi shutdown, service dừng health task, dừng poll schema, flush thống kê, đóng MongoDB, flush Kafka producer và tắt executor.
+- `docker/Dockerfile.replication`: image for the Python replicator
+- `docker/bootstrap-replication.sh`: bootstrap script that creates buckets, registers webhook notifications, and creates a UI user
 
-## 4. Middleware và request tracking
+Source code:
 
-Mọi request đi qua `custom_log_middleware`:
+- `src/common`: shared helper code
+	- `events.py`: event model and JSON parsing
+	- `minio_io.py`: MinIO client helpers
+	- `config.py`: shared config helper module kept in the repo
+- `src/replication`: the active runtime
+	- `app.py`: webhook server, queue, worker loop, initial sync, copy flow
+	- `config.py`: replication settings loaded from environment variables
+	- `dedup.py`: SQLite-backed dedup/state store
 
-1. Sinh `request_id` dạng UUID hex và lưu vào `request.state.request_id`.
-2. Gọi handler tương ứng.
-3. Sau khi xử lý xong, log:
-   - `trace_id`
-   - client
-   - method
-   - path
-   - status code
-   - `data_type`
-   - thời gian xử lý
-   - chi tiết lỗi nếu có
+## How to Run
 
-`request_id` này được dùng xuyên suốt trong log, response lỗi và response thành công.
+Recommended startup:
 
-## 5. Luồng ingest batch
-
-Endpoint: `POST /api/v1/integration/ingest/batch`
-
-### 5.1. Kiểm tra request đầu vào
-
-Hàm `_extract_request_data()` kiểm tra:
-
-1. Header `X-Data-Type` bắt buộc có giá trị.
-2. `Content-Type` phải là `application/xml` hoặc `text/xml`.
-3. Body sau khi trim không được rỗng.
-
-Nếu lỗi, service raise `AppException` và trả XML response lỗi.
-
-### 5.2. Decode XML
-
-Body bytes được decode bằng UTF-8 qua `xml_binary_to_string()`.
-
-Nếu payload không phải UTF-8, service trả lỗi:
-
-- HTTP `400`
-- `errorType = XMLPARSING`
-- message: `XML payload phải được encode UTF-8`
-
-### 5.3. Validate schema batch
-
-Route gọi:
-
-```python
-validateSchemaService.validate_schema_batch(...)
+```bash
+./start.sh
 ```
 
-Logic validate batch:
+On Windows PowerShell:
 
-1. Lấy compiled schema theo `X-Data-Type` từ `SchemaConfig.get_schema(data_type)`.
-2. Parse XML bằng `xmltodict.parse()`.
-3. Với batch, service lấy danh sách bản ghi từ:
-
-```text
-DanhSach.Root
+```powershell
+.\start.ps1
 ```
 
-4. Nếu không có bản ghi `<Root>`, trả lỗi dữ liệu.
-5. Kiểm tra số lượng `<Root>` không vượt `ROOT_LIST_MAX_ITEMS`.
-6. Validate từng bản ghi bằng Pydantic model động:
+The startup scripts do two things:
 
-```python
-compiled_schema.pydantic_model.model_validate(root_item)
+1. Create the external network `stream-s3-replication` if it does not already exist.
+2. Start the three compose files in order: MinIO1, MinIO2, then the replicator stack.
+
+If you prefer manual startup, use these commands instead:
+
+```bash
+docker network create stream-s3-replication
+docker compose -f docker-compose.minio1.yml up -d
+docker compose -f docker-compose.minio2.yml up -d
+docker compose -f docker-compose.replicator.yml up --build -d
 ```
 
-Batch đang dùng cơ chế fail-fast: nếu một bản ghi validate lỗi, service dừng ngay tại bản ghi đầu tiên lỗi, ghi lỗi vào collection `ValidationFailures`, tăng thống kê `data_error` và trả lỗi cho client.
+## What the Bootstrap Script Does
 
-### 5.4. Ghi MongoDB
+When `docker-compose.replicator.yml` starts, it launches a `minio/mc` container that runs `docker/bootstrap-replication.sh`.
 
-Nếu validate thành công, route gọi:
+That script:
 
-```python
-processDataService.batch_insert_update(...)
-```
+- waits until MinIO1 and MinIO2 are reachable
+- creates the `images` bucket on both MinIO instances if needed
+- registers a MinIO webhook notification on MinIO1
+- creates a UI user for object uploads
+- attaches the `readwrite` policy to that user on both MinIO instances
 
-Logic ghi:
+## Runtime Flow
 
-1. Lấy target database/collection từ `compiled_schema`.
-2. Đảm bảo target collection tồn tại.
-3. Đảm bảo index unique trên `IdBanGhi`.
-4. Đảm bảo history collection tồn tại.
-5. Build danh sách `UpdateOne` cho từng record.
+The code path is centered in [src/replication/app.py](src/replication/app.py).
 
-Mỗi record được lấy dữ liệu theo cấu trúc:
+### 1. Service startup
 
-```text
-Root.DuLieuTiepNhan
-Root.TrangThaiDuLieu
-Root.NguonDuLieu
-```
+`main()` reads settings from the environment, creates the shared queue, starts worker threads, and optionally launches the initial sync thread.
 
-Document ghi vào target collection gồm:
+### 2. Initial sync
 
-- toàn bộ dữ liệu trong `DuLieuTiepNhan`
-- `PhienBan`
-- `MaLoaiDuLieu`
-- `IdNguonDuLieu`
-- `Root_TrangThaiDuLieu`
-- `schema_version`
-- `is_deleted`
-- `created_at`
-- `updated_at`
+If `INITIAL_SYNC=true`, `_initial_sync()` lists objects in the source bucket and pushes synthetic events into the same queue used by webhook events.
 
-Rule xử lý version:
+That means initial data and realtime data follow the same downstream path.
 
-```python
-filter={
-    "IdBanGhi": id_ban_ghi,
-    "PhienBan": {"$lt": version}
-}
-```
+### 3. Webhook intake
 
-Nghĩa là service chỉ insert/update khi version mới lớn hơn version hiện tại. Nếu `IdBanGhi` đã tồn tại nhưng version gửi lên không lớn hơn, MongoDB có thể phát sinh duplicate key do unique index và service trả lỗi conflict `409`.
+MinIO1 sends an HTTP `POST` request to `/minio-webhook` whenever an object is created.
 
-### 5.5. Ghi history trong transaction
+`WebhookHandler.do_POST()` reads the body, validates the path, and enqueues the payload.
 
-Service dùng MongoDB transaction:
+### 4. Worker execution
 
-1. Bulk write vào target collection.
-2. Insert history records vào history collection.
+`_worker_loop()` continuously consumes events from the queue and calls `_replicate_event()`.
 
-History record gồm:
+The queue is bounded, so if the service is overloaded, requests can be back-pressured instead of unboundedly consuming memory.
 
-- `schema_version`
-- `business_id`
-- `version`
-- `is_sync`
-- `action`
-- `db_operation`
-- `topic_name`
-- `conflict_reason`
-- `attempted_at`
-- `created_at`
-- `updated_at`
+### 5. Copy decision
 
-Nếu transaction lỗi, service trả lỗi server `500`.
+`_replicate_event()` parses the payload into a `StreamEvent` and then applies these checks:
 
-### 5.6. Thống kê
+- ignore non-copyable event types
+- ignore events from buckets other than the configured source bucket
+- compute a dedup key
+- claim the dedup key in SQLite
+- check whether the destination already has the same object
 
-Sau khi ghi thành công, service tăng thống kê theo key:
+### 6. Data transfer
 
-```text
-datatype_name|topic_name|organization|schema_version|hour
-```
+If the object must be copied, the replicator:
 
-Các counter có thể tăng:
+- reads metadata from MinIO1 with `stat_object`
+- downloads the object body from MinIO1 with `get_object`
+- uploads the object to MinIO2 with `put_object`
 
-- `insert`
-- `update`
-- `skipped`
+This is a streamed transfer. The full object is not loaded into memory at once.
 
-`StatisticService` gom thống kê trong memory và flush định kỳ vào collection analytics.
+### 7. Completion
 
-### 5.7. Produce Kafka
+After a successful transfer, the record is marked `done` in SQLite.
 
-Sau khi ghi MongoDB, nếu schema có:
+If any exception occurs, the record is released so a later retry can attempt the copy again.
 
-```python
-compiled_schema.notify_enabled == True
-```
+## Dedup Strategy
 
-và có insert/update, route produce Kafka cho các record đã xử lý.
+Dedup is implemented in [src/replication/dedup.py](src/replication/dedup.py).
 
-Kafka message không gửi toàn bộ record mà transform thành document gọn:
+The dedup key is built from:
 
-```json
-{
-  "ServiceCode": "...",
-  "IdBanGhi": "...",
-  "PhienBan": "...",
-  "LastModifiedAt": "..."
-}
-```
+- bucket
+- object key
+- etag
 
-Lưu ý: lỗi produce Kafka được log nhưng không rollback kết quả ghi MongoDB trong route batch.
+That means:
 
-### 5.8. Response thành công
+- the same object version is processed once
+- webhook duplicates are ignored
+- an initial sync event and a realtime webhook event for the same object version collapse into one copy
+- a restart does not reprocess already completed objects
 
-Response thành công là XML, gồm:
+### Dedup State Machine
 
-- `status = 200`
-- `message`
-- `responseTime`
-- `requestId`
-- `total`
-- `inserted`
-- `updated`
-- `store`
-- `dataType`
+The SQLite table stores one row per object version.
 
-## 6. Luồng ingest stream
+Status values:
 
-Endpoint: `POST /api/v1/integration/ingest/stream`
+- `processing`: the record has been claimed, but copy is not finished yet
+- `done`: the object has been successfully replicated or was already up to date in MinIO2
 
-Luồng stream gần giống batch, khác ở các điểm:
+Processing TTL:
 
-1. XML đại diện cho một record duy nhất.
-2. Validate bằng:
+- `DEDUP_PROCESSING_TTL_SECONDS` defaults to `600`
+- if a record stays in `processing` too long, it becomes eligible again
+- this protects against worker crashes or abrupt container restarts
 
-```python
-validateSchemaService.validate_schema_stream(...)
-```
+### Claim / Complete / Release
 
-3. Không tách danh sách `DanhSach.Root`.
-4. Ghi DB bằng:
+- `claim()` inserts the dedup key with `processing`
+- if the key already exists, the event is treated as duplicate and skipped
+- `complete()` marks the row as `done`
+- `release()` removes the row when an error happens before completion
 
-```python
-processDataService.stream_insert_update(...)
-```
+## State Storage
 
-5. Nếu `notify_enabled = True` và có insert/update, service produce đúng một Kafka message.
+Persistent state is stored in SQLite.
 
-Nếu validate lỗi, service ghi failure với `processing_mode = STREAM`.
+Default path:
 
-## 7. Cơ chế schema động
+- `DEDUP_DB_PATH=/data/dedup.sqlite3`
 
-Schema validate không hard-code trong source code. Service lấy schema từ MongoDB:
+That path is mounted to the `replication-data` Docker volume in `docker-compose.replicator.yml`, so the dedup state survives restarts.
 
-- Job config collection: mặc định `JobConfigCDDHs`
-- Schema definition collection: mặc định `SchemaDefinitionCDDHs`
+The database stores:
 
-Mỗi job config cung cấp các thông tin chính:
+- dedup key
+- source bucket and key
+- etag
+- file size
+- event type
+- status
+- claim timestamp
+- completion timestamp
 
-- `datatype_name`: dùng để lookup theo header `X-Data-Type`
-- `topic_name`
-- `target_database_name`
-- `target_collection`
-- `target_history_collection`
-- `database_history`
-- `source_version_number`
-- `organization`
-- `notify_enabled`
-- `target_topic`
-- `current_schema_version_id`
-- `is_active`
+## Environment Variables
 
-`SchemaConfig` poll định kỳ theo `SCHEMA_DEFINITION_POLL_INTERVAL`. Lần đầu load toàn bộ job config, các lần sau chỉ lấy document có `updated_at > last_poll`.
+Important variables in `.env.example`:
 
-Sau khi load, mỗi schema được compile thành `CompiledSchema`, gồm:
+- `SOURCE_MINIO_ENDPOINT`
+- `SOURCE_MINIO_ACCESS_KEY`
+- `SOURCE_MINIO_SECRET_KEY`
+- `SOURCE_MINIO_SECURE`
+- `DEST_MINIO_ENDPOINT`
+- `DEST_MINIO_ACCESS_KEY`
+- `DEST_MINIO_SECRET_KEY`
+- `DEST_MINIO_SECURE`
+- `SOURCE_BUCKET`
+- `DEST_BUCKET`
+- `INITIAL_PREFIX`
+- `INITIAL_SYNC`
+- `REPLICATION_WEBHOOK_HOST`
+- `REPLICATION_WEBHOOK_PORT`
+- `REPLICATION_WORKERS`
+- `REPLICATION_QUEUE_SIZE`
+- `DEDUP_DB_PATH`
+- `DEDUP_PROCESSING_TTL_SECONDS`
+- `MINIO_UI_USER`
+- `MINIO_UI_PASSWORD`
 
-- metadata đích ghi MongoDB/Kafka
-- Pydantic model động
-- danh sách field dạng array để hỗ trợ parse XML đúng kiểu list
+## Useful Endpoints
 
-## 8. Rule validate schema
+- MinIO1 console: `http://localhost:9001`
+- MinIO2 console: `http://localhost:9003`
+- Replicator webhook: `http://localhost:8080/minio-webhook`
 
-File `src/utils/schema_ulti.py` tạo Pydantic model từ schema definition.
+## Design Notes
 
-Các rule đang hỗ trợ:
+This implementation is intentionally small and practical.
 
-- `required`
-- `type`: string, integer, float, boolean, object, array
-- `enum`
-- `constant`
-- `pattern`
-- `format` custom như `YYYY`, `MM`, `DD`, `HH`, `MI`, `SS`
-- `minLength`, `maxLength`
-- `minValue`, `maxValue`
-- `minItems`
-- object lồng nhau
-- array item là primitive hoặc object
-- `anyOf` dạng một trong các nhóm field bắt buộc
+Good fit:
 
-Với XML array, service dùng `force_list_callback()` để ép các path array thành list khi parse XML bằng `xmltodict`.
+- simple MinIO-to-MinIO sync
+- moderate write load
+- straightforward debug and deployment
 
-## 9. Xử lý lỗi validate
+Tradeoffs:
 
-Khi parse XML hoặc validate schema lỗi, service ghi document vào analytics collection `ValidationFailures`.
+- single process replicator
+- SQLite is local to the container volume
+- no distributed queue
+- no horizontal coordination across multiple replicator replicas
 
-Thông tin lỗi validate thường gồm:
-
-- `job_type`
-- `schema_version`
-- `error_type`
-- `error_message`
-- `topic_name`
-- `record_index`
-- `id_ban_ghi`
-- `processing_mode`
-- `failed_at`
-- `created_at`
-- `validation_errors`
-- `parsed_data`
-
-Thông điệp lỗi trả về client được rút gọn từ lỗi Pydantic đầu tiên:
-
-- Missing field
-- String quá ngắn/quá dài
-- Sai pattern
-- Các lỗi validate khác
-
-## 10. Cơ chế ghi dữ liệu và conflict version
-
-Service ghi dữ liệu bằng `UpdateOne` với `upsert=True`.
-
-Điều kiện update:
-
-```text
-IdBanGhi trùng và PhienBan hiện tại nhỏ hơn PhienBan mới
-```
-
-Các trường bắt buộc để build operation:
-
-- `Root.DuLieuTiepNhan`
-- `Root.DuLieuTiepNhan.IdBanGhi`
-- `Root.TrangThaiDuLieu.PhienBan`
-
-Nếu thiếu các trường này, service trả lỗi dữ liệu.
-
-Nếu bản ghi đã tồn tại với cùng hoặc version lớn hơn, unique index trên `IdBanGhi` làm upsert thất bại với duplicate key. Service chuyển lỗi này thành:
-
-- HTTP `409`
-- `errorType = VERSION_CONFLICT`
-- message: `Phiên bản của bản ghi phải lớn hơn phiên bản hiện tại.`
-
-## 11. Kafka logic
-
-Kafka producer được tạo lazy singleton trong `KafkaService`.
-
-Cấu hình Kafka lấy từ environment:
-
-- `KAFKA_BOOTSTRAP_SERVERS`
-- `KAFKA_SECURITY_PROTOCOL`
-- `KAFKA_SASL_MECHANISM`
-- `KAFKA_SASL_USERNAME`
-- `KAFKA_SASL_PASSWORD`
-- `KAFKA_CA_CERT_PATH`
-- `KAFKA_REQUEST_TIMEOUT_MS`
-- `KAFKA_DELIVERY_TIMEOUT_MS`
-
-Producer config chính:
-
-- `acks = all`
-- `retries = 3`
-- `max.in.flight.requests.per.connection = 1`
-- request/delivery timeout theo env
-
-Khi produce, service:
-
-1. Transform validated record thành payload Kafka.
-2. Serialize JSON UTF-8.
-3. Gửi vào `compiled_schema.target_topic`.
-4. Flush producer để biết message đã được delivery hay chưa.
-
-## 12. Health check
-
-Endpoint `/api/v1/health` chạy check MongoDB và Kafka song song bằng executor:
-
-- MongoDB: gọi `DatabaseManager.check_connection()`, ping data/job/analytics client.
-- Kafka: dùng `AdminClient.list_topics(timeout=1)`.
-
-Kết quả overall:
-
-- `HEALTHY`: tất cả dependency healthy.
-- `DOWN`: tất cả dependency down.
-- `DEGRADED`: một phần dependency down.
-
-Ngoài endpoint health, background `_health_check_loop()` kiểm tra định kỳ. Nếu dependency lỗi liên tiếp vượt `HEALTH_CHECK_FAILURE_THRESHOLD`, service tự gửi `SIGTERM` để dừng process.
-
-## 13. Response format
-
-Service trả response dạng XML.
-
-Response thành công được tạo bởi `build_success_response()`.
-
-Response lỗi ứng dụng được tạo bởi `app_exception_handler()` từ `AppException`, gồm:
-
-- `responseTime`
-- `status`
-- `errorType`
-- `message` hoặc `error`
-- `requestId`
-- các `extensions` như `store`, `dataType`, `conflicts`
-
-Các lỗi HTTP/validation framework cũng được chuyển về XML qua handler riêng.
-
-## 14. Cache collection và index
-
-File `src/utils/mongo_cache_util.py` cache trạng thái tồn tại của collection và index để giảm số lần gọi MongoDB metadata.
-
-Các TTL:
-
-- `COLLECTION_CACHE_TTL_SECONDS`, mặc định 60 giây.
-- `INDEX_CACHE_TTL_SECONDS`, mặc định 300 giây.
-
-Collection chưa tồn tại sẽ được tạo tự động. Index unique trên `IdBanGhi` cũng được đảm bảo trước khi ghi dữ liệu.
-
-## 15. Tóm tắt luồng tổng thể
-
-```mermaid
-flowchart TD
-    A["Client gửi XML"] --> B["FastAPI route"]
-    B --> C["Kiểm tra X-Data-Type, Content-Type, body"]
-    C --> D["Decode UTF-8"]
-    D --> E["Lấy compiled schema từ SchemaConfig"]
-    E --> F["Parse XML bằng xmltodict"]
-    F --> G["Validate bằng Pydantic model động"]
-    G -->|Lỗi| H["Ghi ValidationFailures, tăng data_error, trả XML lỗi"]
-    G -->|Hợp lệ| I["Build MongoDB UpdateOne"]
-    I --> J["Transaction: ghi data collection và history collection"]
-    J --> K["Tăng thống kê insert/update/skipped"]
-    K --> L{"notify_enabled và có thay đổi?"}
-    L -->|Có| M["Produce Kafka event"]
-    L -->|Không| N["Bỏ qua Kafka"]
-    M --> O["Trả XML success"]
-    N --> O
-```
-
-## 16. Các điểm cần lưu ý khi vận hành
-
-- Header `X-Data-Type` phải khớp schema đang active trong `JobConfig`.
-- Schema được cache trong memory và refresh theo chu kỳ, không đọc DB ở mỗi request.
-- Batch validate theo cơ chế fail-fast, một record lỗi sẽ làm cả request lỗi.
-- MongoDB cần hỗ trợ transaction, thường yêu cầu replica set.
-- Conflict version trả `409` khi `PhienBan` không lớn hơn version hiện có.
-- Kafka chỉ được gọi sau khi ghi DB thành công.
-- Lỗi Kafka trong route được log; dữ liệu đã ghi DB không bị rollback bởi lỗi Kafka.
-- Statistic được buffer trong memory, flush định kỳ và flush lần cuối khi shutdown.
+If you need multi-node replication workers or stronger delivery guarantees, move dedup/state to an external store such as Redis or Postgres.
