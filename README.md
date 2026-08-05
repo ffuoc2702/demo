@@ -16,7 +16,7 @@ Mỗi container cùng join vào một Docker network external: `stream-s3-replic
 
 ## Cấu trúc dự án
 
-Các file ở mức gốc:
+Các file build:
 
 - `docker-compose.minio1.yml`: stack riêng cho MinIO1
 - `docker-compose.minio2.yml`: stack riêng cho MinIO2
