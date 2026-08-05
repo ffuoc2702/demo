@@ -1,10 +1,8 @@
-# MinIO Replication Only
-
-Đây là một giải pháp chỉ tập trung vào replication:
+# MinIO Replication
 
 MinIO1 -> Python replicator -> MinIO2
 
-Stack này không còn dùng Kafka hay Flink. MinIO1 gửi webhook đến một service Python, service có thể quét bucket hiện có khi khởi động, dedup công việc bằng SQLite, rồi stream object từ MinIO1 sang MinIO2.
+MinIO1 gửi webhook đến một service Python, service có thể quét bucket hiện có khi khởi động, dedup bằng SQLite, rồi stream object từ MinIO1 sang MinIO2.
 
 ## Kiến trúc
 
@@ -16,7 +14,7 @@ Runtime được tách thành 3 container chạy độc lập:
 
 Mỗi container cùng join vào một Docker network external: `stream-s3-replication`.
 
-## Cấu Trúc Dự Án
+## Cấu trúc dự án
 
 Các file ở mức gốc:
 
@@ -46,7 +44,7 @@ Mã nguồn:
   - `config.py`: settings của replicator đọc từ biến môi trường
   - `dedup.py`: nơi lưu dedup/state bằng SQLite
 
-## Cách Chạy
+## Cách chạy
 
 Khuyến nghị:
 
@@ -74,7 +72,7 @@ docker compose -f docker-compose.minio2.yml up -d
 docker compose -f docker-compose.replicator.yml up --build -d
 ```
 
-## Bootstrap Script Làm Gì
+## Bootstrap script làm gì
 
 Khi `docker-compose.replicator.yml` chạy, nó sẽ khởi động một container `minio/mc` để thực thi `docker/bootstrap-replication.sh`.
 
@@ -83,10 +81,8 @@ Script này sẽ:
 - đợi đến khi MinIO1 và MinIO2 sẵn sàng
 - tạo bucket `images` trên cả hai MinIO nếu chưa có
 - đăng ký webhook notification trên MinIO1
-- tạo một user UI để upload object
-- gắn policy `readwrite` cho user đó trên cả hai MinIO
 
-## Luồng Hoạt Động
+## Luồng hoạt động
 
 Luồng code chính nằm ở [src/replication/app.py](src/replication/app.py).
 
@@ -96,7 +92,7 @@ Luồng code chính nằm ở [src/replication/app.py](src/replication/app.py).
 
 ### 2. Initial sync
 
-Nếu `INITIAL_SYNC=true`, `_initial_sync()` sẽ list object trong bucket nguồn và đẩy các event giả vào cùng queue dùng cho webhook.
+Nếu `INITIAL_SYNC=true`, `_initial_sync()` sẽ list object trong bucket nguồn và đẩy event vào cùng queue dùng cho webhook.
 
 Nghĩa là dữ liệu cũ và dữ liệu realtime đi chung một downstream path.
 
@@ -138,7 +134,7 @@ Sau khi truyền thành công, record sẽ được đánh dấu `done` trong SQ
 
 Nếu có exception, record sẽ được release để lần retry sau có thể thử lại.
 
-## Chiến Lược Dedup
+## Chiến lược dedup
 
 Dedup được implement trong [src/replication/dedup.py](src/replication/dedup.py).
 
@@ -155,7 +151,7 @@ Dedup key được tạo từ:
 - event initial sync và event realtime của cùng một object version sẽ hợp nhất thành một lần copy
 - restart service sẽ không xử lý lại object đã hoàn thành
 
-### Máy Trạng Thái Dedup
+### Trạng thái dedup
 
 Bảng SQLite lưu một dòng cho mỗi object version.
 
@@ -177,9 +173,9 @@ TTL xử lý:
 - `complete()` đổi trạng thái thành `done`
 - `release()` xóa row nếu có lỗi trước khi hoàn tất
 
-## Lưu State Ở Đâu
+## Lưu state ở đâu
 
-State bền vững được lưu trong SQLite.
+State được lưu trong SQLite.
 
 Đường dẫn mặc định:
 
@@ -198,7 +194,7 @@ Cơ sở dữ liệu lưu các trường sau:
 - thời điểm claim
 - thời điểm complete
 
-## Biến Môi Trường
+## Biến môi trường
 
 Các biến quan trọng trong `.env.example`:
 
@@ -223,15 +219,13 @@ Các biến quan trọng trong `.env.example`:
 - `MINIO_UI_USER`
 - `MINIO_UI_PASSWORD`
 
-## Endpoint Hữu Ích
+## Endpoint
 
 - MinIO1 console: `http://localhost:9001`
 - MinIO2 console: `http://localhost:9003`
 - Replicator webhook: `http://localhost:8080/minio-webhook`
 
-## Ghi Chú Thiết Kế
-
-Implementation này cố ý giữ nhỏ và thực dụng.
+## Ghi chú
 
 Phù hợp với:
 
